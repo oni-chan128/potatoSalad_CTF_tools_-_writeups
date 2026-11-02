@@ -1,5 +1,3 @@
-# potatoSalad_CTF_tools_-_writeups
-scripts and write ups made by yours truly(and Claude of course)
 # 🥔 potatoSalad CTF kit
 
 A single-file, menu-driven CTF toolkit covering Cryptography, Web, Pwn, Forensics, Reverse Engineering, OSINT/Misc, and HTB/THM-style machine workflows — **67 tools, zero third-party dependencies.**
