@@ -14,6 +14,8 @@ import os
 import struct
 import string
 import itertools
+import ast
+import zipfile
 from math import gcd, isqrt
 
 
@@ -667,6 +669,184 @@ def polybius_tool():
     res("Result", result)
     tip("I and J share coordinate (2,4)")
     save_prompt(result)
+
+
+
+
+# ══════════════════════════════════════════════════════════
+#  CRYPTOGRAPHY — OFFLINE FILE PASSWORD TESTER
+# ══════════════════════════════════════════════════════════
+
+def _password_candidates(path):
+    """Yield candidate strings from a wordlist or a literal Python list.
+
+    A .py file is PARSED, never executed. Only assigned literal lists/tuples/sets
+    named like 'passwords', 'keys', or 'candidates' are accepted.
+    """
+    if path.lower().endswith(".py"):
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            source = fh.read(2_000_001)
+        if len(source) > 2_000_000:
+            raise ValueError("Python candidate file is too large (2 MB limit)")
+        tree = ast.parse(source, filename=path)
+        matches = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                value_node = node.value
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                names = [node.target.id]
+                value_node = node.value
+            else:
+                continue
+            if not any(any(hint in name.lower() for hint in
+                           ("password", "candidate", "wordlist", "secret", "keys"))
+                       for name in names):
+                continue
+            try:
+                value = ast.literal_eval(value_node)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                continue
+            if isinstance(value, (list, tuple, set)) and value and all(
+                    isinstance(item, (str, int, bytes)) for item in value):
+                matches.extend(value)
+        if not matches:
+            raise ValueError(
+                "No literal password list found in the .py file. "
+                "If the script GENERATES passwords with loops/functions, "
+                "first export its candidates to a .txt file (one per line). "
+                "Untrusted Python scripts are not executed by this tool.")
+        for item in matches:
+            yield item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
+    else:
+        # Streaming avoids loading very large wordlists into RAM.
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
+            for line in fh:
+                password = line.rstrip("\r\n")
+                if password:
+                    yield password
+
+
+def _test_zip_candidate(archive, encrypted_members, candidate):
+    """Read encrypted members completely, so ZIP CRC checks each password."""
+    try:
+        password = candidate.encode("utf-8")
+        for entry in encrypted_members:
+            # Prevent accidentally unpacking a ZIP bomb for every candidate.
+            if entry.file_size > 50 * 1024 * 1024:
+                raise ValueError("Encrypted ZIP entry exceeds 50 MB verification limit")
+            with archive.open(entry, "r", pwd=password) as member:
+                bytes_read = 0
+                while True:
+                    chunk = member.read(64 * 1024)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    if bytes_read > 50 * 1024 * 1024:
+                        raise ValueError("Encrypted ZIP entry exceeds 50 MB verification limit")
+        return True
+    except (RuntimeError, zipfile.BadZipFile, EOFError, ValueError) as exc:
+        # A too-large entry is a safety limit, not an incorrect password.
+        if isinstance(exc, ValueError) and "50 MB verification limit" in str(exc):
+            raise
+        return False
+    # A NotImplementedError (e.g. unsupported encryption/compression) is
+    # intentionally NOT swallowed: tell the user their ZIP needs another tool.
+
+
+def _xor_decrypt(data, key):
+    """Repeating-key XOR, commonly used in introductory CTF crypto tasks."""
+    return bytes(byte ^ key[i % len(key)] for i, byte in enumerate(data))
+
+
+def offline_password_tester():
+    """Try an offline wordlist against ZIP or repeating-key XOR data."""
+    print(f"\n  {C.BOLD}Offline File Password Tester{C.RESET}")
+    print("  [1] Encrypted ZIP (traditional ZipCrypto)")
+    print("  [2] Repeating-key XOR file (needs a known plaintext marker)")
+    mode = input("  Select format: ").strip()
+    if mode not in ("1", "2"):
+        return err("Invalid option")
+
+    target = os.path.expanduser(input("  Encrypted file path: ").strip())
+    candidate_path = os.path.expanduser(input("  Wordlist (.txt) or literal-list script (.py): ").strip())
+    if not os.path.isfile(target):
+        return err(f"Encrypted file not found: {target}")
+    if not os.path.isfile(candidate_path):
+        return err(f"Candidate file not found: {candidate_path}")
+    if os.path.samefile(target, candidate_path):
+        return err("Choose different encrypted and candidate files")
+
+    archive, members, ciphertext, marker = None, None, None, None
+    try:
+        if mode == "1":
+            archive = zipfile.ZipFile(target)
+            members = [m for m in archive.infolist() if m.flag_bits & 1 and not m.is_dir()]
+            if not members:
+                return err("No password-encrypted files found inside the ZIP archive")
+            if any(m.compress_type == 99 for m in members):
+                return err("AES-encrypted ZIP is not supported by Python's built-in zipfile. Use 7z/John instead.")
+            info(f"Checking {len(members)} encrypted ZIP member(s), no files extracted")
+        else:
+            if os.path.getsize(target) > 25 * 1024 * 1024:
+                return err("XOR input is limited to 25 MB")
+            with open(target, "rb") as fh:
+                ciphertext = fh.read()
+            known = input("  Expected plaintext marker (e.g. flag{, CYLAB{, or hex:504b0304): ").strip()
+            if not known:
+                return err("A known plaintext marker is required to recognize the correct XOR key")
+            if known.lower().startswith("hex:"):
+                try:
+                    marker = bytes.fromhex(known[4:])
+                except ValueError:
+                    return err("Invalid hex marker")
+            else:
+                marker = known.encode("utf-8")
+            if not marker:
+                return err("Marker cannot be empty")
+            info("XOR matches are only candidates until the decrypted content is reviewed")
+
+        tested = 0
+        for password in _password_candidates(candidate_path):
+            tested += 1
+            if not password:
+                continue
+            if mode == "1":
+                matched = _test_zip_candidate(archive, members, password)
+                decrypted = None
+            else:
+                decrypted = _xor_decrypt(ciphertext, password.encode("utf-8"))
+                matched = marker in decrypted
+            if matched:
+                print()
+                ok(f"Candidate found after {tested:,} attempt(s): {C.BOLD}{password}{C.RESET}")
+                if mode == "1":
+                    info("Verified by fully reading encrypted members and checking ZIP CRCs")
+                    info("Archive was NOT extracted; use your normal unzip tool with this password")
+                else:
+                    info("Marker detected in XOR output — inspect contents to confirm")
+                    destination = input("  Save candidate plaintext? (new filename, Enter to skip): ").strip()
+                    if destination:
+                        try:
+                            with open(os.path.expanduser(destination), "xb") as fh:
+                                fh.write(decrypted)
+                            ok(f"Saved to {destination}")
+                        except FileExistsError:
+                            err("Destination exists; refusing to overwrite it")
+                        except OSError as exc:
+                            err(f"Could not save plaintext: {exc}")
+                return
+            if tested % 1000 == 0:
+                print(f"  {C.DIM}{tested:,} tested...{C.RESET}", end="\r", flush=True)
+        print()
+        err(f"No match found among {tested:,} candidate(s)")
+        tip("Make sure the format, password list, and (for XOR) marker are correct")
+        tip("Custom AES/Fernet/Python encryption needs its actual decrypt algorithm; do not assume XOR")
+    except (ValueError, OSError, SyntaxError, UnicodeError, NotImplementedError, zipfile.BadZipFile) as exc:
+        err(f"Cannot complete offline password test: {exc}")
+    finally:
+        if archive is not None:
+            archive.close()
 
 
 # ══════════════════════════════════════════════════════════
@@ -2432,6 +2612,7 @@ MENU = f"""
   65.  JWT HMAC Secret Brute Force                {C.DIM}[new]{C.RESET}
   66.  Magic Auto-Decoder (chained)               {C.DIM}[new]{C.RESET}
   67.  Hash Length Extension Reference            {C.DIM}[new]{C.RESET}
+  68.  Offline File Password Tester               {C.DIM}[new]{C.RESET}
 
   {C.RED} 0.  Exit{C.RESET}
 """
@@ -2475,6 +2656,7 @@ TOOLS = {
     "65": jwt_brute,
     "66": magic_decode,
     "67": hash_extension_reference,
+    "68": offline_password_tester,
 }
 
 
